@@ -287,6 +287,18 @@ function parseCsvLine(line) {
   return cells.map((c) => c.trim());
 }
 
+// Salesforce's stage picklist value sometimes comes through as just the
+// numeric code ("10") and sometimes as "code - Label" ("10 - Assigned to
+// Credit"), depending on the query/export path. All of the dashboard's
+// stage-matching logic (funded/cancelled/declined detection, the Inferred
+// tab's transitions, track detection) expects the bare numeric code, so
+// every incoming stage value is normalized through this function first.
+function extractStageCode(rawValue) {
+  const str = String(rawValue || "").trim();
+  const match = str.match(/^(\d+)/);
+  return match ? match[1] : str;
+}
+
 function parseUploadedData(text, filename) {
   try {
     if (filename.toLowerCase().endsWith(".json")) {
@@ -311,7 +323,7 @@ function parseUploadedData(text, filename) {
         byOpp[oid] = {
           id: oid,
           name: r.Name || oid,
-          track: r.Track || (String(r.NewValue || "").length >= 3 ? "2" : "1"),
+          track: r.Track || (extractStageCode(r.NewValue).length >= 3 ? "2" : "1"),
           createdDate: r.CreatedDate ? new Date(r.CreatedDate).getTime() : Date.now(),
           stageHistory: [],
           funderHistory: [],
@@ -321,7 +333,7 @@ function parseUploadedData(text, filename) {
       if (!ts) return;
       if (r.Field === "StageName") {
         byOpp[oid].stageHistory.push({
-          stage: String(r.NewValue).trim(),
+          stage: extractStageCode(r.NewValue),
           timestamp: ts,
           changedBy: r.ChangedBy ? String(r.ChangedBy).trim() : null,
         });
