@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useEffect } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, Legend, Cell } from "recharts";
 import { Upload, ChevronDown, ChevronRight, Filter, X, Users, Clock, TrendingDown, TrendingUp, AlertCircle } from "lucide-react";
 
@@ -86,7 +86,16 @@ const MULTI_SUBMISSION_STAGES = new Set(["120", "125"]);
 
 // Only these people's edits count toward the inferred model -- everyone else
 // (sales staff, admins, etc.) is excluded entirely, not just de-emphasized.
-const UNDERWRITER_WHITELIST = ["Javier Mendoza", "Jay Cristobal", "Shervin Rashti"];
+// Full roster of people trackable in the Stage History tab. Javier and Jay
+// are the core underwriters and default ON; Shervin and Ishaan are
+// optional -- toggle them on via the checkboxes to include their edits in
+// the attribution, stats, and charts using the exact same logic.
+const TRACKABLE_PEOPLE = ["Javier Mendoza", "Jay Cristobal", "Shervin Rashti", "Ishaan Hussain"];
+const DEFAULT_SELECTED_PEOPLE = ["Javier Mendoza", "Jay Cristobal"];
+// General ops staff tracked separately from underwriting -- Clinton handles
+// the early Logged Deal -> Assigned to Credit intake step, a different job
+// function from Javier/Jay/Shervin's underwriting actions.
+const OPS_NAMES = ["Clinton Ordeniza"];
 
 
 
@@ -195,7 +204,12 @@ function deriveDeals(rawOpps) {
     const isClosed = isCancelled || isDeclined || isFunded;
     const isTerminated = isCancelled || isDeclined;
 
-    // segment durations between consecutive stage events
+    // segment durations between consecutive stage events. Each segment
+    // carries its OWN track based on its actual stage code -- a single
+    // deal can start on the Internal/Balance Sheet track (2-digit stages)
+    // and later move to Syndication (3-digit) after being submitted to
+    // source, so track is a property of each stage transition, not a
+    // fixed property of the whole deal.
     const segments = [];
     for (let i = 0; i < sh.length - 1; i++) {
       const cur = sh[i];
@@ -210,6 +224,7 @@ function deriveDeals(rawOpps) {
         durationDays: durationMs / 86400000,
         phase: isPreAssign ? "origination" : "funder",
         changedBy: next.changedBy || null, // who made the edit that moved it INTO next.stage
+        track: trackOf(cur.stage), // this specific transition's track, not the deal's overall track
       });
     }
     // last stage -> now (still open) or terminal (no further duration needed for milestone calc, but useful for "current age")
@@ -257,7 +272,9 @@ function median(arr) {
 }
 function fmtDays(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  if (v < 1) return `${(v * 24).toFixed(1)}h`;
+  const hours = v * 24;
+  if (hours < 1) return `${Math.round(hours * 60)}m`;
+  if (v < 1) return `${hours.toFixed(1)}h`;
   return `${v.toFixed(1)}d`;
 }
 
@@ -367,10 +384,10 @@ function Pill({ children, tone = "neutral" }) {
   );
 }
 
-function StatCard({ label, value, sub, icon: Icon, tone = "neutral" }) {
+function StatCard({ label, value, sub, icon: Icon, tone = "neutral", tooltip }) {
   const toneColor = { neutral: "#1D2433", good: "#1E7A3D", bad: "#B3261E", accent: "#1D4E89" }[tone];
   return (
-    <div className="bg-white border border-[#E4E7EC] rounded-lg p-4 flex flex-col gap-1 min-w-0">
+    <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-4 flex flex-col gap-1 min-w-0" title={tooltip}>
       <div className="flex items-center justify-between">
         <span className="text-[11px] uppercase tracking-wider text-[#6B7280] font-semibold">{label}</span>
         {Icon && <Icon size={14} color="#9AA3AF" />}
@@ -381,8 +398,42 @@ function StatCard({ label, value, sub, icon: Icon, tone = "neutral" }) {
   );
 }
 
-function StageSelect({ value, onChange, stages, placeholder }) {
+// Custom Recharts tooltip for the avg-time bar charts: shows the average
+// time in both days and hours together, since "1.09 days" alone isn't as
+// immediately intuitive as also seeing "26.2 hours" alongside it.
+function TimeChartTooltip({ active, payload, label }) {
+  if (!active || !payload || !payload.length) return null;
+  const avgEntry = payload.find((p) => p.dataKey === "avg");
+  const countEntry = payload.find((p) => p.dataKey === "count");
+  const days = avgEntry ? avgEntry.value : null;
   return (
+    <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card px-3 py-2 shadow-sm" style={{ fontSize: 12 }}>
+      <div className="font-semibold text-[#1D2433] mb-1">{label}</div>
+      {days !== null && (
+        <>
+          <div className="text-[#4B5563]">Avg time: {fmtDays(days)}</div>
+          <div className="text-[#8A93A3]">({days.toFixed(2)} days)</div>
+        </>
+      )}
+      {countEntry && <div className="text-[#8A93A3] mt-0.5">{countEntry.value} deals</div>}
+    </div>
+  );
+}
+
+// Tooltip for the volume-mode chart: just shows the deal/action count
+// clearly, no time-unit conversion needed.
+function VolumeChartTooltip({ active, payload, label }) {
+  if (!active || !payload || !payload.length) return null;
+  const countEntry = payload.find((p) => p.dataKey === "count");
+  return (
+    <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card px-3 py-2 shadow-sm" style={{ fontSize: 12 }}>
+      <div className="font-semibold text-[#1D2433] mb-1">{label}</div>
+      {countEntry && <div className="text-[#4B5563]">{countEntry.value} deals / actions</div>}
+    </div>
+  );
+}
+
+function StageSelect({ value, onChange, stages, placeholder }) {  return (
     <select
       value={value || ""}
       onChange={(e) => onChange(e.target.value || null)}
@@ -403,10 +454,11 @@ export default function FunderKpiDashboard() {
   const [uploadError, setUploadError] = useState(null);
   const [activeTab, setActiveTab] = useState("funder"); // "funder" | "inferred"
 
-  const ADMIN_NAMES = ["Ishaan Hussain"]; // process/admin — excluded entirely from inferred attribution, not just flagged
-  // Underwriter whitelist takes precedence for the inferred model: only these
-  // people's edits count. (Kept ADMIN_NAMES too since it's harmless as a
-  // second layer, but the whitelist alone already excludes sales staff.)
+  // Which people's edits count toward Stage History attribution. Javier
+  // and Jay are on by default; Shervin and Ishaan are opt-in via
+  // checkboxes in the UI, but once selected use identical logic --
+  // first real occurrence per deal, same charts/stats/breakdown tables.
+  const [selectedPeople, setSelectedPeople] = useState(DEFAULT_SELECTED_PEOPLE);
 
   const [trackFilter, setTrackFilter] = useState("all"); // all | 1 | 2
   const [funderFilter, setFunderFilter] = useState("all");
@@ -416,9 +468,10 @@ export default function FunderKpiDashboard() {
 
   const [milestoneFrom, setMilestoneFrom] = useState("01");
   const [milestoneTo, setMilestoneTo] = useState("90");
-  const [expandedFunder, setExpandedFunder] = useState(null);
-  const [selectedTransitionId, setSelectedTransitionId] = useState(KEY_TRANSITIONS[0].id);
+  const [expandedFunder, setExpandedFunder] = useState(null);  const [selectedTransitionId, setSelectedTransitionId] = useState(KEY_TRANSITIONS[0].id);
   const [expandedPerson, setExpandedPerson] = useState(null);
+  const [expandedOutcomeSections, setExpandedOutcomeSections] = useState({}); // { "personName:outcomeType": true }
+  const [inferredChartMode, setInferredChartMode] = useState("time"); // "time" | "volume"
 
   const deals = useMemo(() => deriveDeals(rawOpps), [rawOpps]);
 
@@ -473,7 +526,6 @@ export default function FunderKpiDashboard() {
     filteredDeals.forEach((d) => {
       const track = trackOf(milestoneFrom);
       if (trackOf(milestoneTo) !== track) return;
-      if (d.track !== track) return;
       const fromEvt = d.stageHistory.find((s) => s.stage === milestoneFrom);
       const toEvt = d.stageHistory.find((s) => s.stage === milestoneTo);
       if (!fromEvt || !toEvt) return;
@@ -541,6 +593,56 @@ export default function FunderKpiDashboard() {
     }).sort((a, b) => b.count - a.count);
   }, [filteredDeals]);
 
+  // Operations/Admin: tracks Clinton's edits for whichever milestone
+  // (from/to stage pair) is currently selected in the Time Between
+  // Milestones picker above -- reuses that same picker rather than a
+  // separate fixed transition, so it only shows data when the selected
+  // stages are ones he actually works (e.g. 01 -> 10).
+  // Operations/Admin intake speed: Created -> first time hitting stage 10.
+  // Salesforce Field History Tracking only logs CHANGES to a field, not
+  // its value at record creation -- so most deals never get an explicit
+  // "01" history row even though 01 is genuinely their starting stage
+  // (confirmed: ~91% of deals in this dataset have "10" as their first
+  // tracked stage event, not "01"). Using the deal's real CreatedDate as
+  // the start point instead of requiring a literal 01 row captures the
+  // true intake time and correctly attributes it to whoever's edit first
+  // moved the deal into stage 10 -- Clinton's real volume (~1800 deals)
+  // was being undercounted to just 65 when this required an explicit
+  // 01->10 transition, since most 01 entries were never tracked.
+  const opsRows = useMemo(() => {
+    const rows = [];
+    if (milestoneFrom !== "01" || milestoneTo !== "10") return rows; // only applies to this specific milestone
+    inferredFilteredDeals.forEach((d) => {
+      const sh = d.stageHistory; // already sorted by timestamp in deriveDeals
+      let firstTenEvent = null;
+      const seenStages = new Set();
+      for (const s of sh) {
+        if (s.stage === "10" && !seenStages.has("10")) {
+          firstTenEvent = s;
+          break;
+        }
+        seenStages.add(s.stage);
+      }
+      if (!firstTenEvent || !firstTenEvent.changedBy) return;
+      if (!OPS_NAMES.includes(firstTenEvent.changedBy)) return;
+      const days = (firstTenEvent.timestamp - d.createdDate) / 86400000;
+      if (days < 0) return; // guard against any data oddity
+      rows.push({ dealId: d.id, person: firstTenEvent.changedBy, days });
+    });
+    return rows;
+  }, [inferredFilteredDeals, milestoneFrom, milestoneTo]);
+
+  const opsByPerson = useMemo(() => {
+    const groups = {};
+    opsRows.forEach((r) => {
+      if (!groups[r.person]) groups[r.person] = [];
+      groups[r.person].push(r.days);
+    });
+    return Object.entries(groups)
+      .map(([person, days]) => ({ person, count: days.length, avg: mean(days), median: median(days) }))
+      .sort((a, b) => b.count - a.count);
+  }, [opsRows]);
+
   // stage-duration breakdown per funder (for expanded row) - only funder-phase segments
   function funderStageBreakdown(funder) {
     const segs = [];
@@ -568,8 +670,8 @@ export default function FunderKpiDashboard() {
   );
 
   const isUnderwriter = useCallback(
-    (person) => person && UNDERWRITER_WHITELIST.includes(person) && !ADMIN_NAMES.includes(person),
-    []
+    (person) => person && selectedPeople.includes(person),
+    [selectedPeople]
   );
 
   const inferredRows = useMemo(() => {
@@ -740,9 +842,42 @@ export default function FunderKpiDashboard() {
     count: r.count,
   }));
 
-  const chartData = milestoneByFunder.map((r) => ({ name: r.funder, avg: Number(r.avg?.toFixed(2) || 0), count: r.count }));
+  // The top milestone chart is keyed by Assigned Funder (Javier/Jay/etc)
+  // by default, but for the 01->10 milestone specifically, ops staff
+  // (Clinton) should also appear -- a different attribution model (who
+  // made the edit, not who the deal's funder is), folded into the same
+  // chart so both views are visible together for this one milestone.
+  const chartData = [
+    ...milestoneByFunder.map((r) => ({ name: r.funder, avg: Number(r.avg?.toFixed(2) || 0), count: r.count, isOps: false })),
+    ...opsByPerson.map((r) => ({ name: r.person, avg: Number(r.avg?.toFixed(2) || 0), count: r.count, isOps: true })),
+  ];
 
-  const stagesForTrack = trackFilter === "2" ? STAGES_TRACK_2 : trackFilter === "1" ? STAGES_TRACK_1 : STAGES_TRACK_1;
+  // Milestone stage pickers always offer stages from BOTH tracks -- a
+  // single deal can have both Internal/Balance Sheet stages (early) and
+  // Syndication stages (after being submitted to source), so restricting
+  // the dropdown to one track based on the record-type filter would hide
+  // valid milestone combinations.
+  // Milestone stage pickers respect the record-type filter: if a specific
+  // track is selected, only that track's stages are offered (so you can't
+  // pick a nonsensical cross-track pair like Internal->174 Docs Out). When
+  // "All record types" is selected, both tracks' stages are available,
+  // since a single deal can legitimately span both (e.g. 01 -> 120).
+  const stagesForTrack = trackFilter === "1" ? STAGES_TRACK_1 : trackFilter === "2" ? STAGES_TRACK_2 : ALL_STAGES;
+
+  // If the record-type filter changes to a specific track and the current
+  // milestone selection isn't valid for that track (e.g. "174 - Docs Out"
+  // selected while filtering to Internal/Balance Sheet), reset both
+  // dropdowns to that track's default stages rather than leaving an
+  // orphaned selection that no longer appears in the dropdown's options.
+  useEffect(() => {
+    const validCodes = new Set(stagesForTrack.map(([c]) => c));
+    if (!validCodes.has(milestoneFrom) || !validCodes.has(milestoneTo)) {
+      const defaults = trackFilter === "2" ? ["101", "190"] : trackFilter === "1" ? ["01", "90"] : ["01", "90"];
+      setMilestoneFrom(defaults[0]);
+      setMilestoneTo(defaults[1]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackFilter]);
 
   // This should be the Apps Script WEB APP url (Deploy -> New deployment ->
   // Web app), NOT the Sheets "Publish to web" CSV url -- Google's Sheets
@@ -757,6 +892,7 @@ export default function FunderKpiDashboard() {
   const SALESFORCE_ACCESS_KEY = "rH[!-naWP]_WQ^NI";
 
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState(null);
 
   // Apps Script Web Apps don't reliably support CORS for plain fetch()
@@ -832,41 +968,65 @@ export default function FunderKpiDashboard() {
       setUploadError(err.message || "Failed to refresh from Salesforce.");
     } finally {
       setIsRefreshing(false);
+      setHasLoadedOnce(true);
     }
   }, [loadViaJsonp]);
 
+  // Auto-refresh once when the dashboard first loads, so it shows live
+  // data immediately instead of requiring a manual click every visit.
+  // This just re-fetches the Apps Script's cached Sheet data (cheap --
+  // doesn't touch Salesforce, which only syncs once daily on its own
+  // schedule), so it's safe to do on every page load/reload.
+  useEffect(() => {
+    refreshFromSalesforce();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
-    <div className="w-full min-h-screen bg-[#F6F7F9] text-[#1D2433]" style={{ fontFamily: "'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif" }}>
+    <div className="w-full min-h-screen bg-[#F6F7F9] text-[#1D2433]" style={{ fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, Helvetica, Arial, sans-serif" }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
-        .mono { font-family: 'IBM Plex Mono', monospace; }
+        .mono { font-family: 'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', monospace; font-variant-numeric: tabular-nums; }
         table.kpi-table { border-collapse: collapse; width: 100%; }
         table.kpi-table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #6B7280; font-weight: 600; padding: 8px 12px; border-bottom: 1px solid #E4E7EC; }
         table.kpi-table td { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #EEF0F3; }
         table.kpi-table tr:hover td { background: #FAFBFC; }
+        .fintech-card {
+          transition: box-shadow 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
+          box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+        }
+        .fintech-card:hover {
+          box-shadow: 0 4px 16px -4px rgba(29, 78, 137, 0.14), 0 2px 6px -2px rgba(16, 24, 40, 0.08);
+          transform: translateY(-1px);
+          border-color: #C7D2E0;
+        }
       `}</style>
 
+      {!hasLoadedOnce ? (
+        <div className="min-h-screen flex flex-col items-center justify-center gap-3">
+          <Upload size={28} color="#1D4E89" className="animate-spin" />
+          <p className="text-[14px] font-medium text-[#4B5563]">Loading Funder KPI Dashboard…</p>
+          <p className="text-[12px] text-[#8A93A3]">Pulling the latest data from Salesforce</p>
+        </div>
+      ) : (
+        <>
       {/* Header */}
-      <div className="border-b border-[#E4E7EC] bg-white px-6 py-4 flex items-center justify-between sticky top-0 z-10">
+      <div className="border-b border-[#E4E7EC] bg-white px-6 py-4 flex items-center justify-between sticky top-0 z-10" style={{ boxShadow: "0 1px 2px rgba(16, 24, 40, 0.04)" }}>
         <div>
           <h1 className="text-lg font-semibold text-[#1D2433]">Funder KPI Dashboard</h1>
           <p className="text-[12px] text-[#8A93A3] mt-0.5">Time-in-stage &amp; time-to-milestone tracking, split by origination and funder-assigned phases</p>
         </div>
         <div className="flex items-center gap-3">
           {usingSample && <Pill tone="accent">Sample data</Pill>}
-          {lastRefreshed && (
+          {isRefreshing && (
+            <span className="flex items-center gap-1.5 text-[12px] text-[#8A93A3]">
+              <Upload size={13} className="animate-spin" /> Loading latest data…
+            </span>
+          )}
+          {!isRefreshing && lastRefreshed && (
             <span className="text-[12px] text-[#8A93A3]">
               Last refreshed {lastRefreshed.toLocaleDateString()} {lastRefreshed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
             </span>
           )}
-          <button
-            onClick={refreshFromSalesforce}
-            disabled={isRefreshing}
-            className="flex items-center gap-2 text-[13px] font-medium border border-[#D8DCE3] rounded px-3 py-1.5 hover:bg-[#F6F7F9] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <Upload size={14} className={isRefreshing ? "animate-spin" : ""} />
-            {isRefreshing ? "Refreshing…" : "Refresh from Salesforce"}
-          </button>
         </div>
       </div>
       {uploadError && (
@@ -883,7 +1043,7 @@ export default function FunderKpiDashboard() {
             activeTab === "funder" ? "border-[#1D4E89] text-[#1D4E89]" : "border-transparent text-[#8A93A3] hover:text-[#4B5563]"
           }`}
         >
-          Assigned Funder (concrete)
+          Assigned Funder
         </button>
         <button
           onClick={() => setActiveTab("inferred")}
@@ -891,7 +1051,7 @@ export default function FunderKpiDashboard() {
             activeTab === "inferred" ? "border-[#1D4E89] text-[#1D4E89]" : "border-transparent text-[#8A93A3] hover:text-[#4B5563]"
           }`}
         >
-          Inferred (stage actions)
+          Stage History
         </button>
       </div>
 
@@ -899,14 +1059,14 @@ export default function FunderKpiDashboard() {
       <div className="px-6 py-5 flex flex-col gap-5">
 
         {/* Filters */}
-        <div className="bg-white border border-[#E4E7EC] rounded-lg p-4 flex flex-wrap items-center gap-3">
+        <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-4 flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7280] mr-1">
             <Filter size={13} /> Filters
           </div>
           <select value={trackFilter} onChange={(e) => setTrackFilter(e.target.value)} className="text-[13px] border border-[#D8DCE3] rounded px-2 py-1.5 bg-white">
             <option value="all">All record types</option>
-            <option value="1">01-99 track</option>
-            <option value="2">101-199 track</option>
+            <option value="1">Internal/Balance Sheet</option>
+            <option value="2">Syndication</option>
           </select>
           <select
             value={funderFilter}
@@ -948,7 +1108,13 @@ export default function FunderKpiDashboard() {
         {/* Summary stat cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
           <StatCard label="Total deals" value={summary.total} icon={Users} />
-          <StatCard label="Open" value={summary.open} icon={Clock} />
+          <StatCard
+            label="Open"
+            value={summary.open}
+            sub="Still in the pipeline"
+            tooltip="Any deal that hasn't reached a final outcome yet — includes deals at Additional Info Requested, Assigned to Credit, Submitted to Source, Approved/Terms Accepted, or any other in-progress stage. Excludes Funded, Cancelled, and Declined deals."
+            icon={Clock}
+          />
           <StatCard label="Funded" value={summary.won} sub="Reached 85/185 or 90/190" tone="good" icon={TrendingUp} />
           <StatCard label="Cancelled" value={summary.cancelled} tone="bad" icon={TrendingDown} />
           <StatCard label="Declined" value={summary.declined} tone="bad" icon={TrendingDown} />
@@ -958,7 +1124,7 @@ export default function FunderKpiDashboard() {
 
         {/* Milestone picker + chart */}
         {activeTab === "funder" && (
-        <div className="bg-white border border-[#E4E7EC] rounded-lg p-4">
+        <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-4">
           <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
             <h2 className="text-[13px] font-semibold text-[#1D2433]">Time between milestones</h2>
             <div className="flex items-center gap-2 flex-wrap">
@@ -968,7 +1134,7 @@ export default function FunderKpiDashboard() {
             </div>
           </div>
           {trackFilter === "all" && (
-            <p className="text-[12px] text-[#8A93A3] mb-2">Showing results for the {trackOf(milestoneFrom) === "2" ? "101-199" : "01-99"} track (based on selected stages). Set the record-type filter above to scope explicitly.</p>
+            <p className="text-[12px] text-[#8A93A3] mb-2">Showing results for the {trackOf(milestoneFrom) === "2" ? "Syndication" : "Internal/Balance Sheet"} track (based on selected stages). Set the record-type filter above to scope explicitly.</p>
           )}
           {chartData.length === 0 ? (
             <p className="text-[13px] text-[#8A93A3] py-8 text-center">No deals in the current filter have passed through both selected stages.</p>
@@ -979,12 +1145,9 @@ export default function FunderKpiDashboard() {
                   <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F3" vertical={false} />
                   <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#6B7280" }} />
                   <YAxis tick={{ fontSize: 11, fill: "#6B7280" }} label={{ value: "days", angle: -90, position: "insideLeft", fontSize: 11, fill: "#8A93A3" }} />
-                  <Tooltip
-                    formatter={(v, n) => [n === "avg" ? `${v} days` : v, n === "avg" ? "Avg time" : "Deals"]}
-                    contentStyle={{ fontSize: 12, borderRadius: 6, border: "1px solid #E4E7EC" }}
-                  />
+                  <Tooltip content={<TimeChartTooltip />} />
                   <Bar dataKey="avg" radius={[4, 4, 0, 0]}>
-                    {chartData.map((_, i) => <Cell key={i} fill="#1D4E89" />)}
+                    {chartData.map((d, i) => <Cell key={i} fill={d.isOps ? "#D9770A" : "#1D4E89"} />)}
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
@@ -993,9 +1156,39 @@ export default function FunderKpiDashboard() {
         </div>
         )}
 
+        {/* Operations/Admin: Clinton's edits for whichever milestone is selected above */}
+        {activeTab === "funder" && opsByPerson.length > 0 && (
+          <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card overflow-hidden">
+            <div className="px-4 py-3 border-b border-[#E4E7EC]">
+              <h2 className="text-[13px] font-semibold text-[#1D2433]">Operations/Admin</h2>
+              <p className="text-[12px] text-[#8A93A3] mt-0.5">
+                {STAGE_LABEL[milestoneFrom] || milestoneFrom} → {STAGE_LABEL[milestoneTo] || milestoneTo} — intake/ops work, tracked separately from underwriting.
+              </p>
+            </div>
+            <table className="kpi-table">
+              <thead>
+                <tr><th>Person</th><th>Deals</th><th>Avg time</th><th>Median time</th></tr>
+              </thead>
+              <tbody>
+                {opsByPerson.map((r) => (
+                  <tr key={r.person}>
+                    <td className="font-medium flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full" style={{ background: "#D9770A" }}></span>
+                      {r.person}
+                    </td>
+                    <td className="mono">{r.count}</td>
+                    <td className="mono">{fmtDays(r.avg)}</td>
+                    <td className="mono">{fmtDays(r.median)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
         {/* Per-funder KPI table */}
         {activeTab === "funder" && (
-        <div className="bg-white border border-[#E4E7EC] rounded-lg overflow-hidden">
+        <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card overflow-hidden">
           <div className="px-4 py-3 border-b border-[#E4E7EC]">
             <h2 className="text-[13px] font-semibold text-[#1D2433]">Funder performance</h2>
             <p className="text-[12px] text-[#8A93A3] mt-0.5">Funder-phase metrics only — time from assignment (Docs In) onward. Click a row for per-stage breakdown.</p>
@@ -1061,7 +1254,7 @@ export default function FunderKpiDashboard() {
 
         {/* Milestone leaderboard table */}
         {activeTab === "funder" && milestoneByFunder.length > 0 && (
-          <div className="bg-white border border-[#E4E7EC] rounded-lg overflow-hidden">
+          <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card overflow-hidden">
             <div className="px-4 py-3 border-b border-[#E4E7EC]">
               <h2 className="text-[13px] font-semibold text-[#1D2433]">
                 {STAGE_LABEL[milestoneFrom] || milestoneFrom} → {STAGE_LABEL[milestoneTo] || milestoneTo}
@@ -1096,7 +1289,7 @@ export default function FunderKpiDashboard() {
         {activeTab === "inferred" && (
           <>
             {!hasChangedByData && (
-              <div className="bg-white border border-[#E4E7EC] rounded-lg p-6 text-center">
+              <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-6 text-center">
                 <AlertCircle size={20} color="#B3261E" className="mx-auto mb-2" />
                 <p className="text-[14px] font-medium text-[#1D2433]">No "Changed By" data found in the imported file</p>
                 <p className="text-[12px] text-[#8A93A3] mt-1 max-w-md mx-auto">
@@ -1105,11 +1298,11 @@ export default function FunderKpiDashboard() {
               </div>
             )}
 
-            <div className="bg-white border border-[#E4E7EC] rounded-lg p-4">
+            <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-4">
               <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
                 <div>
                   <h2 className="text-[13px] font-semibold text-[#1D2433]">Inferred stage-action attribution</h2>
-                  <p className="text-[12px] text-[#8A93A3] mt-0.5">Time credited to whoever's edit moved the deal forward. Only Javier, Jay, and Shervin are tracked — everyone else is excluded.</p>
+                  <p className="text-[12px] text-[#8A93A3] mt-0.5">Time credited to whoever's edit moved the deal forward. Only {selectedPeople.length ? selectedPeople.join(", ") : "no one"} {selectedPeople.length === 1 ? "is" : "are"} tracked — everyone else is excluded.</p>
                 </div>
                 <select
                   value={selectedTransitionId}
@@ -1122,21 +1315,69 @@ export default function FunderKpiDashboard() {
                 </select>
               </div>
 
+              <div className="flex items-center gap-4 flex-wrap mb-3 pb-3 border-b border-[#EEF0F3]">
+                <span className="text-[11px] uppercase tracking-wide text-[#8A93A3] font-semibold">Include</span>
+                {TRACKABLE_PEOPLE.map((person) => {
+                  const checked = selectedPeople.includes(person);
+                  return (
+                    <label key={person} className="flex items-center gap-1.5 text-[12px] text-[#4B5563] cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => {
+                          setSelectedPeople((prev) =>
+                            prev.includes(person) ? prev.filter((p) => p !== person) : [...prev, person]
+                          );
+                        }}
+                        className="w-3.5 h-3.5 accent-[#1D4E89]"
+                      />
+                      {person}
+                    </label>
+                  );
+                })}
+              </div>
+
+              <div className="inline-flex items-center border border-[#D8DCE3] rounded-lg overflow-hidden mb-3">
+                <button
+                  onClick={() => setInferredChartMode("time")}
+                  className={`text-[12px] font-semibold px-4 py-1.5 transition-colors ${
+                    inferredChartMode === "time"
+                      ? "bg-[#1D4E89] text-white"
+                      : "bg-white text-[#4B5563] hover:bg-[#F6F7F9]"
+                  }`}
+                >
+                  Avg time
+                </button>
+                <button
+                  onClick={() => setInferredChartMode("volume")}
+                  className={`text-[12px] font-semibold px-4 py-1.5 border-l border-[#D8DCE3] transition-colors ${
+                    inferredChartMode === "volume"
+                      ? "bg-[#1E7A3D] text-white"
+                      : "bg-white text-[#4B5563] hover:bg-[#F6F7F9]"
+                  }`}
+                >
+                  Volume
+                </button>
+              </div>
+
               {inferredChartData.length === 0 ? (
                 <p className="text-[13px] text-[#8A93A3] py-8 text-center">No deals in the current filter have a recorded edit for this transition.</p>
               ) : (
                 <div style={{ width: "100%", height: 220 }}>
                   <ResponsiveContainer>
-                    <BarChart data={inferredChartData} margin={{ top: 8, right: 8, left: 0, bottom: 8 }}>
+                    <BarChart
+                      data={[...inferredChartData].sort((a, b) => a.name.localeCompare(b.name))}
+                      margin={{ top: 8, right: 8, left: 0, bottom: 8 }}
+                    >
                       <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F3" vertical={false} />
                       <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#6B7280" }} />
-                      <YAxis tick={{ fontSize: 11, fill: "#6B7280" }} label={{ value: "days", angle: -90, position: "insideLeft", fontSize: 11, fill: "#8A93A3" }} />
-                      <Tooltip
-                        formatter={(v, n) => [n === "avg" ? `${v} days` : v, n === "avg" ? "Avg time" : "Deals"]}
-                        contentStyle={{ fontSize: 12, borderRadius: 6, border: "1px solid #E4E7EC" }}
+                      <YAxis
+                        tick={{ fontSize: 11, fill: "#6B7280" }}
+                        label={{ value: inferredChartMode === "volume" ? "deals" : "days", angle: -90, position: "insideLeft", fontSize: 11, fill: "#8A93A3" }}
                       />
-                      <Bar dataKey="avg" radius={[4, 4, 0, 0]}>
-                        {inferredChartData.map((_, i) => <Cell key={i} fill="#1D4E89" />)}
+                      <Tooltip content={inferredChartMode === "volume" ? <VolumeChartTooltip /> : <TimeChartTooltip />} />
+                      <Bar dataKey={inferredChartMode === "volume" ? "count" : "avg"} radius={[4, 4, 0, 0]}>
+                        {inferredChartData.map((_, i) => <Cell key={i} fill={inferredChartMode === "volume" ? "#1E7A3D" : "#1D4E89"} />)}
                       </Bar>
                     </BarChart>
                   </ResponsiveContainer>
@@ -1147,7 +1388,7 @@ export default function FunderKpiDashboard() {
             {/* Per-person collapsible cards */}
             <div className="flex flex-col gap-3">
               {inferredByPerson.length === 0 && (
-                <div className="bg-white border border-[#E4E7EC] rounded-lg p-6 text-center text-[13px] text-[#8A93A3]">
+                <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-6 text-center text-[13px] text-[#8A93A3]">
                   No data for this transition in the current filter.
                 </div>
               )}
@@ -1165,7 +1406,7 @@ export default function FunderKpiDashboard() {
                 });
 
                 return (
-                  <div key={r.person} className="bg-white border border-[#E4E7EC] rounded-lg overflow-hidden">
+                  <div key={r.person} className="bg-white border border-[#E4E7EC] rounded-lg fintech-card overflow-hidden">
                     <button
                       onClick={() => setExpandedPerson(isOpen ? null : r.person)}
                       className="w-full flex items-center justify-between px-4 py-3 hover:bg-[#FAFBFC] transition-colors text-left"
@@ -1200,53 +1441,68 @@ export default function FunderKpiDashboard() {
                           <>
                             {/* New vs returning summary */}
                             <div className="grid grid-cols-2 gap-3 mb-4">
-                              <div className="bg-white border border-[#E4E7EC] rounded-lg p-3">
+                              <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-3">
                                 <div className="text-[11px] uppercase tracking-wide text-[#6B7280] font-semibold mb-1">New deals</div>
                                 <div className="text-[18px] font-semibold mono text-[#1D2433]">{r.newCount}</div>
                                 <div className="text-[12px] text-[#8A93A3]">avg {fmtDays(r.newAvg)} — first time reaching this stage</div>
                               </div>
-                              <div className="bg-white border border-[#E4E7EC] rounded-lg p-3">
+                              <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-3">
                                 <div className="text-[11px] uppercase tracking-wide text-[#6B7280] font-semibold mb-1">Returning deals</div>
                                 <div className="text-[18px] font-semibold mono text-[#1D2433]">{r.returningCount}</div>
                                 <div className="text-[12px] text-[#8A93A3]">avg {fmtDays(r.returningAvg)} — came back from a later stage</div>
                               </div>
                             </div>
 
-                            {/* Color-coded outcome sections */}
+                            {/* Color-coded outcome sections, collapsible */}
                             {["approval", "decline", "info", "cancelled", "other"].map((otype) => {
                               const rows = byOutcome[otype];
                               if (!rows || rows.length === 0) return null;
                               const style = OUTCOME_STYLES[otype];
+                              const sectionKey = r.person + ":" + otype;
+                              const sectionOpen = !!expandedOutcomeSections[sectionKey];
+                              const totalDeals = rows.reduce((sum, row) => sum + row.count, 0);
+                              const weightedAvg = rows.reduce((sum, row) => sum + row.avg * row.count, 0) / (totalDeals || 1);
                               return (
-                                <div key={otype} className="mb-3 last:mb-0">
-                                  <div className="flex items-center gap-1.5 mb-1.5">
-                                    <span className="w-2 h-2 rounded-full" style={{ background: style.text }}></span>
-                                    <span className="text-[12px] font-semibold" style={{ color: style.text }}>{style.label}</span>
-                                  </div>
-                                  <div className="rounded-lg overflow-hidden border" style={{ borderColor: style.bg }}>
-                                    <table className="kpi-table">
-                                      <thead>
-                                        <tr style={{ background: style.bg }}>
-                                          <th>Destination stage</th><th>New / Returning</th><th>Deals</th><th>Avg time</th><th>Median</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {rows.map((row) => (
-                                          <tr key={`${row.stage}-${row.occurrenceType}`}>
-                                            <td>{row.stageLabel}</td>
-                                            <td>
-                                              <Pill tone={row.occurrenceType === "new" ? "accent" : "neutral"}>
-                                                {row.occurrenceType === "new" ? "New" : "Returning"}
-                                              </Pill>
-                                            </td>
-                                            <td className="mono">{row.count}</td>
-                                            <td className="mono">{fmtDays(row.avg)}</td>
-                                            <td className="mono">{fmtDays(row.median)}</td>
+                                <div key={otype} className="mb-2 last:mb-0">
+                                  <button
+                                    onClick={() => setExpandedOutcomeSections((prev) => ({ ...prev, [sectionKey]: !prev[sectionKey] }))}
+                                    className="w-full flex items-center justify-between gap-2 py-1.5 hover:opacity-80 transition-opacity"
+                                  >
+                                    <div className="flex items-center gap-1.5">
+                                      {sectionOpen ? <ChevronDown size={12} color={style.text} /> : <ChevronRight size={12} color={style.text} />}
+                                      <span className="w-2 h-2 rounded-full" style={{ background: style.text }}></span>
+                                      <span className="text-[12px] font-semibold" style={{ color: style.text }}>{style.label}</span>
+                                    </div>
+                                    <span className="text-[11px] text-[#8A93A3]">
+                                      {totalDeals} deals · avg {fmtDays(weightedAvg)}
+                                    </span>
+                                  </button>
+                                  {sectionOpen && (
+                                    <div className="rounded-lg overflow-hidden border mt-1" style={{ borderColor: style.bg }}>
+                                      <table className="kpi-table">
+                                        <thead>
+                                          <tr style={{ background: style.bg }}>
+                                            <th>Destination stage</th><th>New / Returning</th><th>Deals</th><th>Avg time</th><th>Median</th>
                                           </tr>
-                                        ))}
-                                      </tbody>
-                                    </table>
-                                  </div>
+                                        </thead>
+                                        <tbody>
+                                          {rows.map((row) => (
+                                            <tr key={`${row.stage}-${row.occurrenceType}`}>
+                                              <td>{row.stageLabel}</td>
+                                              <td>
+                                                <Pill tone={row.occurrenceType === "new" ? "accent" : "neutral"}>
+                                                  {row.occurrenceType === "new" ? "New" : "Returning"}
+                                                </Pill>
+                                              </td>
+                                              <td className="mono">{row.count}</td>
+                                              <td className="mono">{fmtDays(row.avg)}</td>
+                                              <td className="mono">{fmtDays(row.median)}</td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  )}
                                 </div>
                               );
                             })}
@@ -1258,7 +1514,7 @@ export default function FunderKpiDashboard() {
                             )}
                           </>
                         ) : (
-                          <div className="bg-white border border-[#E4E7EC] rounded-lg p-3">
+                          <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-3">
                             <table className="kpi-table">
                               <thead>
                                 <tr><th>Deals</th><th>Avg time</th><th>Median time</th><th>Had additional rounds</th></tr>
@@ -1281,14 +1537,16 @@ export default function FunderKpiDashboard() {
                 );
               })}
             </div>
-
-            <p className="text-[11px] text-[#AAB1BC] text-center pb-4 max-w-2xl mx-auto">
-              Only Javier Mendoza, Jay Cristobal, and Shervin Rashti are tracked here — everyone else's edits (sales staff, admin/process work) are excluded entirely, not just de-emphasized. If a deal's first matching stage-change was made by someone off this list, the next occurrence made by one of these three is credited instead; a deal is only dropped if none of the three ever touched that transition.
-            </p>
           </>
 
         )}
+
+        <p className="text-[11px] text-[#AAB1BC] text-center py-6">
+          This site is the property of SLIM Capital, LLC and is intended solely for internal review and private use.
+        </p>
       </div>
+        </>
+      )}
     </div>
   );
 }
