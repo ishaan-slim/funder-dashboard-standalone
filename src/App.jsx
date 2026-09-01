@@ -76,6 +76,28 @@ const OUTCOME_STYLES = {
   info: { bg: "#FEF6E0", text: "#8A6D1D", label: "More info requested" },
   other: { bg: "#EEF0F3", text: "#4B5563", label: "Other" },
 };
+
+// Categorical color palette for the Lender Performance chart/table --
+// cycles through if there are more lenders than colors. Chosen for
+// visual distinctness at a glance, not tied to approval rate or any
+// other metric.
+const LENDER_COLOR_PALETTE = [
+  "#1D4E89", "#1E7A3D", "#B3261E", "#8A6D1D", "#6B4FA0",
+  "#0E7C86", "#C2410C", "#4338CA", "#BE185D", "#166534",
+  "#9333EA", "#0369A1", "#A16207", "#B91C1C", "#0F766E",
+];
+function colorForLender(lenderName, allLenderNames) {
+  const idx = allLenderNames.indexOf(lenderName);
+  return LENDER_COLOR_PALETTE[idx % LENDER_COLOR_PALETTE.length];
+}
+function initialsForLender(lenderName) {
+  return lenderName
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase())
+    .join("");
+}
+
 function outcomeTypeOf(stageCode) {
   return OUTCOME_TYPE[String(stageCode)] || "other";
 }
@@ -316,6 +338,38 @@ function extractStageCode(rawValue) {
   return match ? match[1] : str;
 }
 
+// Parses the funding_sources sheet's CSV shape (distinct from the main
+// output.csv): OpportunityId,Name,Track,CreatedDate,LenderName,Status,
+// SubmittedDate,SubmittedBy -- one row per lender submission, not an
+// event log, so no per-opportunity grouping is needed here.
+function parseFundingSourceData(text) {
+  try {
+    const lines = text.trim().split(/\r?\n/);
+    if (lines.length < 2) return [];
+    const headers = parseCsvLine(lines[0]);
+    return lines.slice(1).map((l) => {
+      const cells = parseCsvLine(l);
+      const row = {};
+      headers.forEach((h, i) => (row[h] = cells[i] !== undefined ? cells[i] : ""));
+      return {
+        opportunityId: row.OpportunityId || "",
+        name: row.Name || "",
+        track: row.Track || "1",
+        createdDate: row.CreatedDate ? new Date(row.CreatedDate).getTime() : null,
+        lenderName: (row.LenderName || "").trim(),
+        status: (row.Status || "").trim(),
+        submittedDate: row.SubmittedDate ? new Date(row.SubmittedDate).getTime() : null,
+        submittedBy: (row.SubmittedBy || "").trim(),
+        lastModifiedDate: row.LastModifiedDate ? new Date(row.LastModifiedDate).getTime() : null,
+        lastModifiedBy: (row.LastModifiedBy || "").trim(),
+      };
+    }).filter((r) => r.opportunityId && r.lenderName);
+  } catch (e) {
+    console.warn("Failed to parse funding source data:", e);
+    return [];
+  }
+}
+
 function parseUploadedData(text, filename) {
   try {
     if (filename.toLowerCase().endsWith(".json")) {
@@ -433,6 +487,23 @@ function VolumeChartTooltip({ active, payload, label }) {
   );
 }
 
+// Lender chart tooltip: since the x-axis shows abbreviated initials only,
+// this shows the full lender name plus all four core stats on hover.
+function LenderChartTooltip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0] && payload[0].payload;
+  if (!d) return null;
+  return (
+    <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card px-3 py-2 shadow-sm" style={{ fontSize: 12 }}>
+      <div className="font-semibold text-[#1D2433] mb-1">{d.fullName}</div>
+      <div className="text-[#4B5563]">Deals submitted: {d.submitted}</div>
+      <div className="text-[#1E7A3D]">Deals approved: {d.approved}</div>
+      <div className="text-[#4B5563]">Approval rate: {d.rate === null ? "—" : `${d.rate.toFixed(1)}%`}</div>
+      <div className="text-[#B3261E]">Decline rate: {d.declineRate === null ? "—" : `${d.declineRate.toFixed(1)}%`}</div>
+    </div>
+  );
+}
+
 function StageSelect({ value, onChange, stages, placeholder }) {  return (
     <select
       value={value || ""}
@@ -450,9 +521,10 @@ function StageSelect({ value, onChange, stages, placeholder }) {  return (
 // ---------- Main App ----------
 export default function FunderKpiDashboard() {
   const [rawOpps, setRawOpps] = useState(() => generateSampleData());
+  const [rawFundingSources, setRawFundingSources] = useState([]);
   const [usingSample, setUsingSample] = useState(true);
   const [uploadError, setUploadError] = useState(null);
-  const [activeTab, setActiveTab] = useState("funder"); // "funder" | "inferred"
+  const [activeTab, setActiveTab] = useState("funder"); // "funder" | "inferred" | "lenders"
 
   // Which people's edits count toward Stage History attribution. Javier
   // and Jay are on by default; Shervin and Ishaan are opt-in via
@@ -466,12 +538,20 @@ export default function FunderKpiDashboard() {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
 
+  // Lender Performance tab has its OWN date filter, scoped to when each
+  // Funding_Source__c record was submitted (its CreatedDate) -- separate
+  // from the Assigned Funder/Stage History tabs' "Created" filter, which
+  // is about the Opportunity's creation date instead.
+  const [lenderDateFrom, setLenderDateFrom] = useState("");
+  const [lenderDateTo, setLenderDateTo] = useState("");
+
   const [milestoneFrom, setMilestoneFrom] = useState("01");
   const [milestoneTo, setMilestoneTo] = useState("90");
   const [expandedFunder, setExpandedFunder] = useState(null);  const [selectedTransitionId, setSelectedTransitionId] = useState(KEY_TRANSITIONS[0].id);
   const [expandedPerson, setExpandedPerson] = useState(null);
   const [expandedOutcomeSections, setExpandedOutcomeSections] = useState({}); // { "personName:outcomeType": true }
   const [inferredChartMode, setInferredChartMode] = useState("time"); // "time" | "volume"
+  const [lenderChartMode, setLenderChartMode] = useState("approved"); // "approved" | "volume"
 
   const deals = useMemo(() => deriveDeals(rawOpps), [rawOpps]);
 
@@ -673,6 +753,146 @@ export default function FunderKpiDashboard() {
     (person) => person && selectedPeople.includes(person),
     [selectedPeople]
   );
+
+  // Submission volume + approval rate: for each deal, find whoever's edit
+  // FIRST moved it into 120/130/135 (Submitted to Source) -- that's the
+  // denominator, one per deal, credited to the submitter. The numerator is
+  // how many of THAT SAME person's submitted deals also reached 150
+  // (Approved) at any point afterward. This is a different question from
+  // the "Submitted to Source -> Approved" KEY_TRANSITION above, which
+  // tracks whoever made the specific 120/130/135->150 edit -- that can be
+  // a different person than who originally submitted the deal.
+  const SUBMIT_STAGES = useMemo(() => new Set(["120", "130", "135"]), []);
+  const submissionStats = useMemo(() => {
+    const submitted = {};
+    const approved = {};
+    inferredFilteredDeals.forEach((d) => {
+      const sh = d.stageHistory;
+      let submitter = null;
+      let submitIdx = null;
+      for (let i = 0; i < sh.length; i++) {
+        if (SUBMIT_STAGES.has(sh[i].stage)) {
+          submitter = sh[i].changedBy;
+          submitIdx = i;
+          break;
+        }
+      }
+      if (!submitter || !isUnderwriter(submitter)) return;
+      submitted[submitter] = (submitted[submitter] || 0) + 1;
+      const reachedApproval = sh.slice(submitIdx).some((s) => s.stage === "150");
+      if (reachedApproval) approved[submitter] = (approved[submitter] || 0) + 1;
+    });
+    return Object.keys(submitted)
+      .map((person) => ({
+        person,
+        submitted: submitted[person],
+        approved: approved[person] || 0,
+        rate: submitted[person] ? (approved[person] || 0) / submitted[person] : null,
+      }))
+      .sort((a, b) => b.submitted - a.submitted);
+  }, [inferredFilteredDeals, isUnderwriter, SUBMIT_STAGES]);
+
+  // Applies the Lender Performance tab's own date filter (on each
+  // submission's CreatedDate/submittedDate) -- separate from the other
+  // tabs' Created-date filter, which scopes by Opportunity creation.
+  const filteredFundingSources = useMemo(() => {
+    return rawFundingSources.filter((r) => {
+      if (lenderDateFrom && (!r.submittedDate || r.submittedDate < new Date(lenderDateFrom).getTime())) return false;
+      if (lenderDateTo && (!r.submittedDate || r.submittedDate > new Date(lenderDateTo).getTime() + 86400000)) return false;
+      return true;
+    });
+  }, [rawFundingSources, lenderDateFrom, lenderDateTo]);
+
+  // Lender Performance: per lender, total submissions, approvals,
+  // declines, and approval rate. Uses filteredFundingSources (one row
+  // per lender submission) -- independent of the Stage History tab's
+  // underwriter whitelist, since this tracks lenders, not staff.
+  //
+  // Note: time-to-decision isn't computable from this data yet --
+  // Funding_Source__c stores only the CURRENT status, not a history of
+  // when it changed (Status__c isn't Field-History-Tracked the way
+  // Opportunity.StageName is), so there's no reliable "when was this
+  // approved/declined" timestamp to measure against SubmittedDate.
+  const lenderStats = useMemo(() => {
+    const byLender = {};
+    filteredFundingSources.forEach((r) => {
+      if (!r.lenderName) return;
+      if (!byLender[r.lenderName]) {
+        byLender[r.lenderName] = { submitted: 0, approved: 0, declined: 0, pending: 0 };
+      }
+      const g = byLender[r.lenderName];
+      g.submitted += 1;
+      const status = r.status.toLowerCase();
+      if (status === "approved") g.approved += 1;
+      else if (status === "declined") g.declined += 1;
+      else if (status === "pending" || status === "submitted" || status === "more info needed") g.pending += 1;
+    });
+    return Object.entries(byLender)
+      .map(([lender, g]) => ({
+        lender,
+        submitted: g.submitted,
+        approved: g.approved,
+        declined: g.declined,
+        pending: g.pending,
+        rate: g.submitted ? g.approved / g.submitted : null,
+        declineRate: g.submitted ? g.declined / g.submitted : null,
+      }))
+      .sort((a, b) => b.submitted - a.submitted);
+  }, [filteredFundingSources]);
+
+  // Overall Lender Performance summary: total submitted/approved/declined
+  // across ALL lenders combined, plus a syndication-specific funded
+  // conversion rate. "Funded" here means the deal reached 185 or 190
+  // SPECIFICALLY (the Syndication-track funded stages) -- not the
+  // double-digit equivalents (85/90), since every deal in this
+  // denominator is by definition a syndicated (3-digit) deal already.
+  // Also counts "stale" submissions: still Pending/Submitted/More Info
+  // Needed AND not modified in the last 7 days.
+  const lenderSummary = useMemo(() => {
+    const dealById = {};
+    deals.forEach((d) => { dealById[d.id] = d; });
+
+    const uniqueSubmittedOppIds = new Set();
+    let totalSubmitted = 0, totalApproved = 0, totalDeclined = 0, staleCount = 0;
+    const STALE_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    filteredFundingSources.forEach((r) => {
+      if (!r.lenderName) return;
+      totalSubmitted += 1;
+      uniqueSubmittedOppIds.add(r.opportunityId);
+      const status = r.status.toLowerCase();
+      if (status === "approved") totalApproved += 1;
+      else if (status === "declined") totalDeclined += 1;
+      const isNonFinal = status === "pending" || status === "submitted" || status === "more info needed";
+      if (isNonFinal && r.lastModifiedDate && (now - r.lastModifiedDate) > STALE_THRESHOLD_MS) {
+        staleCount += 1;
+      }
+    });
+
+    // Syndication-funded conversion: of the UNIQUE deals submitted to any
+    // lender (on the 3-digit track), how many reached 185/190 specifically.
+    let syndicatedSubmittedCount = 0;
+    let syndicatedFundedCount = 0;
+    uniqueSubmittedOppIds.forEach((oid) => {
+      const d = dealById[oid];
+      if (!d || d.track !== "2") return; // only count Syndication-track deals
+      syndicatedSubmittedCount += 1;
+      const reachedSyndicatedFunded = d.stageHistory.some((s) => s.stage === "185" || s.stage === "190");
+      if (reachedSyndicatedFunded) syndicatedFundedCount += 1;
+    });
+
+    return {
+      totalSubmitted,
+      totalApproved,
+      totalDeclined,
+      staleCount,
+      approvalRate: totalSubmitted ? totalApproved / totalSubmitted : null,
+      declineRate: totalSubmitted ? totalDeclined / totalSubmitted : null,
+      syndicatedSubmittedCount,
+      syndicatedFundedCount,
+      syndicatedConversionRate: syndicatedSubmittedCount ? syndicatedFundedCount / syndicatedSubmittedCount : null,
+    };
+  }, [filteredFundingSources, deals]);
 
   const inferredRows = useMemo(() => {
     const rows = [];
@@ -964,6 +1184,24 @@ export default function FunderKpiDashboard() {
       setRawOpps(parsed);
       setUsingSample(false);
       setLastRefreshed(new Date());
+
+      // Also pull the funding_sources sheet (lender submissions), using
+      // the same endpoint with ?sheet=funding_sources. This is a
+      // best-effort fetch -- if it fails (e.g. the sheet doesn't exist
+      // yet on an older Apps Script deployment), the main dashboard data
+      // above has already loaded successfully, so we don't want a
+      // Lender Performance-specific failure to block everything else.
+      try {
+        const fsUrl = SALESFORCE_CSV_URL + separator + "sheet=funding_sources&_cb=" + Date.now() + keyParam;
+        const fsPayload = await loadViaJsonp(fsUrl);
+        if (fsPayload && fsPayload.ok && fsPayload.data) {
+          setRawFundingSources(parseFundingSourceData(fsPayload.data));
+        }
+      } catch (fsErr) {
+        // Silent -- Lender Performance tab will just show "no data" rather
+        // than blocking the rest of the dashboard from loading.
+        console.warn("Could not load funding_sources data:", fsErr);
+      }
     } catch (err) {
       setUploadError(err.message || "Failed to refresh from Salesforce.");
     } finally {
@@ -1053,12 +1291,21 @@ export default function FunderKpiDashboard() {
         >
           Stage History
         </button>
+        <button
+          onClick={() => setActiveTab("lenders")}
+          className={`px-4 py-2 text-[13px] font-medium rounded-t border-b-2 transition-colors ${
+            activeTab === "lenders" ? "border-[#1D4E89] text-[#1D4E89]" : "border-transparent text-[#8A93A3] hover:text-[#4B5563]"
+          }`}
+        >
+          Lender Performance
+        </button>
       </div>
 
 
       <div className="px-6 py-5 flex flex-col gap-5">
 
-        {/* Filters */}
+        {/* Filters -- not shown on Lender Performance, which has its own self-contained summary */}
+        {activeTab !== "lenders" && (
         <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-4 flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7280] mr-1">
             <Filter size={13} /> Filters
@@ -1104,8 +1351,10 @@ export default function FunderKpiDashboard() {
             </button>
           )}
         </div>
+        )}
 
         {/* Summary stat cards */}
+        {activeTab !== "lenders" && (
         <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
           <StatCard label="Total deals" value={summary.total} icon={Users} />
           <StatCard
@@ -1121,6 +1370,7 @@ export default function FunderKpiDashboard() {
           <StatCard label="Avg origination time" value={fmtDays(summary.avgOrigination)} sub="Created → funder assigned" tone="accent" />
           <StatCard label="Avg funder time" value={fmtDays(summary.avgFunderTime)} sub="Assigned → latest stage" tone="accent" />
         </div>
+        )}
 
         {/* Milestone picker + chart */}
         {activeTab === "funder" && (
@@ -1385,6 +1635,33 @@ export default function FunderKpiDashboard() {
               )}
             </div>
 
+            {/* Submission volume & approval rate -- independent of the transition dropdown above */}
+            {submissionStats.length > 0 && (
+              <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card overflow-hidden">
+                <div className="px-4 py-3 border-b border-[#E4E7EC]">
+                  <h2 className="text-[13px] font-semibold text-[#1D2433]">Submission volume &amp; approval rate</h2>
+                  <p className="text-[12px] text-[#8A93A3] mt-0.5">
+                    Credited to whoever's edit first moved the deal into Submitted to Source (120/130/135). Approval rate = deals that also reached 150 - Present Approval Terms, divided by total submitted.
+                  </p>
+                </div>
+                <table className="kpi-table">
+                  <thead>
+                    <tr><th>Person</th><th>Submitted</th><th>Approved</th><th>Approval rate</th></tr>
+                  </thead>
+                  <tbody>
+                    {submissionStats.map((r) => (
+                      <tr key={r.person}>
+                        <td className="font-medium">{r.person}</td>
+                        <td className="mono">{r.submitted}</td>
+                        <td className="mono">{r.approved}</td>
+                        <td className="mono">{r.rate === null ? "—" : `${(r.rate * 100).toFixed(1)}%`}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
             {/* Per-person collapsible cards */}
             <div className="flex flex-col gap-3">
               {inferredByPerson.length === 0 && (
@@ -1539,6 +1816,153 @@ export default function FunderKpiDashboard() {
             </div>
           </>
 
+        )}
+
+        {/* ---------------- LENDER PERFORMANCE TAB ---------------- */}
+        {activeTab === "lenders" && (
+          <>
+            {/* Lender Performance has its own minimal filter: date range on
+                when each Funding_Source__c record was submitted, not the
+                Opportunity's Created date used elsewhere. */}
+            <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-4 flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7280] mr-1">
+                <Filter size={13} /> Filters
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[12px] text-[#8A93A3]">Submitted</span>
+                <input type="date" value={lenderDateFrom} onChange={(e) => setLenderDateFrom(e.target.value)} className="text-[13px] border border-[#D8DCE3] rounded px-2 py-1.5" />
+                <span className="text-[12px] text-[#8A93A3]">to</span>
+                <input type="date" value={lenderDateTo} onChange={(e) => setLenderDateTo(e.target.value)} className="text-[13px] border border-[#D8DCE3] rounded px-2 py-1.5" />
+              </div>
+              {(lenderDateFrom || lenderDateTo) && (
+                <button
+                  onClick={() => { setLenderDateFrom(""); setLenderDateTo(""); }}
+                  className="flex items-center gap-1 text-[12px] text-[#B3261E] ml-1"
+                >
+                  <X size={12} /> Clear
+                </button>
+              )}
+            </div>
+
+            {lenderStats.length === 0 && (
+              <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-6 text-center">
+                <AlertCircle size={20} color="#B3261E" className="mx-auto mb-2" />
+                <p className="text-[14px] font-medium text-[#1D2433]">No lender submission data loaded</p>
+                <p className="text-[12px] text-[#8A93A3] mt-1 max-w-md mx-auto">
+                  This tab reads the "funding_sources" sheet from your Salesforce sync. Make sure the Apps Script has run at least once since the Funding Source tracking was added, and try refreshing, or widen the date filter above.
+                </p>
+              </div>
+            )}
+
+            {lenderStats.length > 0 && (
+              <>
+                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+                  <StatCard label="Total submitted" value={lenderSummary.totalSubmitted} icon={Users} />
+                  <StatCard label="Approved" value={lenderSummary.totalApproved} tone="good" icon={TrendingUp} />
+                  <StatCard label="Approval rate" value={lenderSummary.approvalRate === null ? "—" : `${(lenderSummary.approvalRate * 100).toFixed(1)}%`} tone="good" />
+                  <StatCard label="Declined" value={lenderSummary.totalDeclined} tone="bad" icon={TrendingDown} />
+                  <StatCard label="Decline rate" value={lenderSummary.declineRate === null ? "—" : `${(lenderSummary.declineRate * 100).toFixed(1)}%`} tone="bad" />
+                  <StatCard
+                    label="Syndication funded rate"
+                    value={lenderSummary.syndicatedConversionRate === null ? "—" : `${(lenderSummary.syndicatedConversionRate * 100).toFixed(1)}%`}
+                    sub={`${lenderSummary.syndicatedFundedCount} of ${lenderSummary.syndicatedSubmittedCount} submitted`}
+                    tooltip="Of the syndicated (3-digit track) deals submitted to any lender, the share that reached 185 or 190 (Syndication-specific Funded/Closed-Won stages)."
+                    tone="accent"
+                  />
+                </div>
+
+                <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card p-4">
+                  <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+                    <h2 className="text-[13px] font-semibold text-[#1D2433]">Lender approval rates</h2>
+                    <div className="inline-flex items-center border border-[#D8DCE3] rounded-lg overflow-hidden">
+                      <button
+                        onClick={() => setLenderChartMode("approved")}
+                        className={`text-[12px] font-semibold px-4 py-1.5 transition-colors ${
+                          lenderChartMode === "approved" ? "bg-[#1D4E89] text-white" : "bg-white text-[#4B5563] hover:bg-[#F6F7F9]"
+                        }`}
+                      >
+                        Approval rate
+                      </button>
+                      <button
+                        onClick={() => setLenderChartMode("volume")}
+                        className={`text-[12px] font-semibold px-4 py-1.5 border-l border-[#D8DCE3] transition-colors ${
+                          lenderChartMode === "volume" ? "bg-[#1E7A3D] text-white" : "bg-white text-[#4B5563] hover:bg-[#F6F7F9]"
+                        }`}
+                      >
+                        Volume
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-[12px] text-[#8A93A3] mb-3">Same lender order in both views — hover a bar for the full name and stats.</p>
+                  <div style={{ width: "100%", height: 300 }}>
+                    <ResponsiveContainer>
+                      <BarChart
+                        data={lenderStats.map((r) => ({
+                          name: initialsForLender(r.lender),
+                          fullName: r.lender,
+                          rate: r.rate !== null ? Number((r.rate * 100).toFixed(1)) : 0,
+                          declineRate: r.declineRate !== null ? Number((r.declineRate * 100).toFixed(1)) : null,
+                          submitted: r.submitted,
+                          approved: r.approved,
+                        }))}
+                        margin={{ top: 8, right: 8, left: 0, bottom: 8 }}
+                        barCategoryGap="30%"
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F3" vertical={false} />
+                        <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#6B7280" }} interval={0} />
+                        <YAxis
+                          tick={{ fontSize: 11, fill: "#6B7280" }}
+                          label={{ value: lenderChartMode === "volume" ? "deals submitted" : "% approved", angle: -90, position: "insideLeft", fontSize: 11, fill: "#8A93A3" }}
+                        />
+                        <Tooltip content={<LenderChartTooltip />} />
+                        <Bar dataKey={lenderChartMode === "volume" ? "submitted" : "rate"} radius={[4, 4, 0, 0]}>
+                          {lenderStats.map((r, i) => (
+                            <Cell key={i} fill={colorForLender(r.lender, lenderStats.map((x) => x.lender))} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="bg-white border border-[#E4E7EC] rounded-lg fintech-card overflow-hidden">
+                  <div className="px-4 py-3 border-b border-[#E4E7EC]">
+                    <h2 className="text-[13px] font-semibold text-[#1D2433]">Lender Performance</h2>
+                    <p className="text-[12px] text-[#8A93A3] mt-0.5">Deals submitted and approved per lender, from the funding_sources sync.</p>
+                  </div>
+                  <table className="kpi-table">
+                    <thead>
+                      <tr><th>Lender</th><th>Submitted</th><th>Approved</th><th>Declined</th><th>Pending</th><th>Approval rate</th></tr>
+                    </thead>
+                    <tbody>
+                      {lenderStats.map((r) => (
+                        <tr key={r.lender}>
+                          <td className="font-medium">
+                            <span className="inline-flex items-center gap-1.5">
+                              <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: colorForLender(r.lender, lenderStats.map((x) => x.lender)) }}></span>
+                              {r.lender}
+                            </span>
+                          </td>
+                          <td className="mono">{r.submitted}</td>
+                          <td className="mono text-[#1E7A3D]">{r.approved}</td>
+                          <td className="mono text-[#B3261E]">{r.declined}</td>
+                          <td className="mono">{r.pending}</td>
+                          <td className="mono">{r.rate === null ? "—" : `${(r.rate * 100).toFixed(1)}%`}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <p className="text-[11px] text-[#AAB1BC] text-center max-w-2xl mx-auto">
+                  {lenderSummary.staleCount > 0
+                    ? `${lenderSummary.staleCount} funding source record${lenderSummary.staleCount === 1 ? "" : "s"} still pending/awaiting info and not updated in over 7 days.`
+                    : "No stale funding source records — everything pending has been touched within the last 7 days."}
+                  {" "}Time-to-decision isn't shown yet — Salesforce doesn't currently track history on the submission Status field, only its current value, so there's no reliable timestamp for when a decision was made.
+                </p>
+              </>
+            )}
+          </>
         )}
 
         <p className="text-[11px] text-[#AAB1BC] text-center py-6">
