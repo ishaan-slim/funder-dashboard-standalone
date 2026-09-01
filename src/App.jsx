@@ -1121,7 +1121,7 @@ export default function FunderKpiDashboard() {
   // the same URL directly in a browser tab works fine). JSONP sidesteps
   // this entirely by loading the response via a <script> tag instead --
   // those have always been allowed cross-origin, since they predate CORS.
-  const loadViaJsonp = useCallback((url, timeoutMs = 15000) => {
+  const loadViaJsonp = useCallback((url, timeoutMs = 30000) => {
     return new Promise((resolve, reject) => {
       const callbackName = "__sfDashboardCallback_" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
       const script = document.createElement("script");
@@ -1170,8 +1170,22 @@ export default function FunderKpiDashboard() {
       // the Apps Script sync updates this data daily, so a fresh fetch
       // each time the button is clicked matters.
       const bustUrl = SALESFORCE_CSV_URL + separator + "_cb=" + Date.now() + keyParam;
+      const fsUrl = SALESFORCE_CSV_URL + separator + "sheet=funding_sources&_cb=" + Date.now() + keyParam;
 
-      const payload = await loadViaJsonp(bustUrl);
+      // Fetch both sheets IN PARALLEL rather than one after another --
+      // sequential awaits meant the total wait was the SUM of both
+      // requests' latency (e.g. ~10s + ~10s = ~20s, blowing past the
+      // timeout), when running them together only takes as long as the
+      // slower of the two.
+      const [mainResult, fsResult] = await Promise.allSettled([
+        loadViaJsonp(bustUrl),
+        loadViaJsonp(fsUrl),
+      ]);
+
+      if (mainResult.status !== "fulfilled") {
+        throw mainResult.reason || new Error("Failed to load data from Salesforce.");
+      }
+      const payload = mainResult.value;
       if (!payload || typeof payload.ok === "undefined") {
         throw new Error("Unexpected response shape from the data source.");
       }
@@ -1185,22 +1199,13 @@ export default function FunderKpiDashboard() {
       setUsingSample(false);
       setLastRefreshed(new Date());
 
-      // Also pull the funding_sources sheet (lender submissions), using
-      // the same endpoint with ?sheet=funding_sources. This is a
-      // best-effort fetch -- if it fails (e.g. the sheet doesn't exist
-      // yet on an older Apps Script deployment), the main dashboard data
-      // above has already loaded successfully, so we don't want a
+      // funding_sources is best-effort -- if it fails, the main dashboard
+      // data above has already loaded successfully, so we don't want a
       // Lender Performance-specific failure to block everything else.
-      try {
-        const fsUrl = SALESFORCE_CSV_URL + separator + "sheet=funding_sources&_cb=" + Date.now() + keyParam;
-        const fsPayload = await loadViaJsonp(fsUrl);
-        if (fsPayload && fsPayload.ok && fsPayload.data) {
-          setRawFundingSources(parseFundingSourceData(fsPayload.data));
-        }
-      } catch (fsErr) {
-        // Silent -- Lender Performance tab will just show "no data" rather
-        // than blocking the rest of the dashboard from loading.
-        console.warn("Could not load funding_sources data:", fsErr);
+      if (fsResult.status === "fulfilled" && fsResult.value && fsResult.value.ok && fsResult.value.data) {
+        setRawFundingSources(parseFundingSourceData(fsResult.value.data));
+      } else if (fsResult.status === "rejected") {
+        console.warn("Could not load funding_sources data:", fsResult.reason);
       }
     } catch (err) {
       setUploadError(err.message || "Failed to refresh from Salesforce.");
