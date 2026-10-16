@@ -37,7 +37,7 @@ export default function AuthGate({ children }) {
           Sign out ({user.email})
         </button>
       </div>
-      {children}
+      {React.isValidElement(children) ? React.cloneElement(children, { userEmail: user.email }) : children}
     </div>
   );
 }
