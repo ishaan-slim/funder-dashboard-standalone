@@ -312,10 +312,12 @@ const SALES_CANCELLED_STAGES = new Set(["98", "198"]);
 // listed sees a "No access yet" page (which shows their code, so they can
 // send it to an admin).
 const ADMIN_EMAIL_HASHES = [
+  "29155a98021437798f23bcc3c71614080d3dfe2b453cc5d1441c2d176f181087", // shervin@slimcapital.com
   "e2cc4a7c4d5436c8c5a5d6db11e9294f74c336d619cd20ce6c7f4b098736602a", // ishaan@slimcapital.com
 ]; // full access: every tab
 const SALES_EMAIL_HASHES = [
-  "0b94b2de0c7588c8fb7243fbdd654c0c3f4a7f2a34654d969b4d4a6be633c8aa", // jeff
+  "0b94b2de0c7588c8fb7243fbdd654c0c3f4a7f2a34654d969b4d4a6be633c8aa", // jeff@slimcapital.com
+  // paste Jeff Brannon's hash here, in quotes, followed by a comma
 ]; // Sales tab only
 async function sha256Hex(text) {
   const bytes = new TextEncoder().encode(text);
